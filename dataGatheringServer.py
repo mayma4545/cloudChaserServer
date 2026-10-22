@@ -135,8 +135,11 @@ CORS(app)
 latest_gathered_data = None
 recent_history = []
 latest_direct_sensor = None
+latest_sensor_received_monotonic = None
 prev_weather_state = None
 ACTIVE_CSV_PATH = DEFAULT_CSV_PATH
+SENSOR_TIMEOUT_SECONDS = 2.0
+CLOUD_TIMEOUT_SECONDS = 2.0
 
 # Thread-safe Sky Telemetry (updated by headless background video worker)
 sky_telemetry_lock = threading.Lock()
@@ -154,6 +157,42 @@ latest_sky_telemetry = {
     "stream_status": "Starting background stream...",
     "last_updated": "Never"
 }
+latest_sky_received_monotonic = None
+
+
+def get_sensor_status():
+    if latest_sensor_received_monotonic is None:
+        status = "NOT AVAILABLE"
+        age = None
+    else:
+        age = max(0.0, time.monotonic() - latest_sensor_received_monotonic)
+        status = "CONNECTED" if age <= SENSOR_TIMEOUT_SECONDS else "DISCONNECTED"
+    data = latest_direct_sensor or {}
+    components = {
+        "temperature_humidity": "AVAILABLE" if data.get("temperature_c") is not None and data.get("humidity_pct") is not None and status == "CONNECTED" else status if status != "CONNECTED" else "NOT AVAILABLE",
+        "pressure": "AVAILABLE" if status == "CONNECTED" and data.get("pressure_hpa") is not None else status if status != "CONNECTED" else "NOT AVAILABLE",
+        "wind": "AVAILABLE" if status == "CONNECTED" and data.get("wind_speed_ms") is not None and data.get("wind_direction_deg") is not None else status if status != "CONNECTED" else "NOT AVAILABLE",
+        "rain": "AVAILABLE" if status == "CONNECTED" and data.get("rain_wet") is not None else status if status != "CONNECTED" else "NOT AVAILABLE"
+    }
+    return {"status": status, "available": status == "CONNECTED", "age_seconds": round(age, 2) if age is not None else None, "timeout_seconds": SENSOR_TIMEOUT_SECONDS, "components": components}
+
+
+def get_cloud_status(telemetry=None):
+    if telemetry is None:
+        with sky_telemetry_lock:
+            telemetry = latest_sky_telemetry.copy()
+    if latest_sky_received_monotonic is None:
+        status = "NOT AVAILABLE"
+        age = None
+    else:
+        age = max(0.0, time.monotonic() - latest_sky_received_monotonic)
+        if age > CLOUD_TIMEOUT_SECONDS:
+            status = "DISCONNECTED"
+        elif "FALLBACK" in str(telemetry.get("stream_status", "")).upper():
+            status = "AVAILABLE (LOCAL VIDEO)"
+        else:
+            status = "CONNECTED"
+    return {"status": status, "available": status.startswith("CONNECTED") or status.startswith("AVAILABLE"), "age_seconds": round(age, 2) if age is not None else None, "timeout_seconds": CLOUD_TIMEOUT_SECONDS}
 
 # =============================================================================
 # 4. LOAD MACHINE LEARNING & COMPUTER VISION MODELS
@@ -219,7 +258,7 @@ def headless_video_worker(stream_url, analysis_fps=1.0, use_circular_mask=True):
     Consumes live RTSP or video stream entirely in memory without opening any window.
     Extracts cloud thickness, coverage, density, light, and cloud genus in real time.
     """
-    global video_worker_running, latest_sky_telemetry
+    global video_worker_running, latest_sky_telemetry, latest_sky_received_monotonic
 
     # Resolve local fallback video if needed
     source = stream_url
@@ -405,6 +444,7 @@ def headless_video_worker(stream_url, analysis_fps=1.0, use_circular_mask=True):
                     "stream_status": "ONLINE (Headless RTSP)",
                     "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
+                latest_sky_received_monotonic = time.monotonic()
 
         cap.release()
         time.sleep(1.0)
@@ -426,6 +466,8 @@ CSV_COLUMNS = [
     "rain_sensor_wetness_pct",
     "rain_sensor_wet",
     "sensor_timestamp",
+    "sensor_status",
+    "sensor_age_seconds",
     "cloud_base_height_m",
     "cloud_thickness_pct",
     "cloud_coverage_pct",
@@ -450,7 +492,9 @@ CSV_COLUMNS = [
     "predicted_rainfall_category",
     "data_source",
     "stream_status",
-    "sky_telemetry_last_updated"
+    "sky_telemetry_last_updated",
+    "cloud_status",
+    "cloud_age_seconds"
 ]
 
 csv_lock = threading.Lock()
@@ -566,16 +610,20 @@ def load_csv_history(csv_path=None):
 # 7. DATA GATHERING & COMPREHENSIVE PREDICTION ENGINE
 # =============================================================================
 def fetch_local_sensor_data():
-    global latest_direct_sensor
+    global latest_direct_sensor, latest_sensor_received_monotonic
     if latest_direct_sensor is not None:
-        return latest_direct_sensor
+        return latest_direct_sensor if get_sensor_status()["available"] else None
 
     if os.path.exists(LOCAL_SENSOR_JSON):
         try:
             with open(LOCAL_SENSOR_JSON, "r") as f:
                 data = json.load(f)
                 if isinstance(data, dict) and "temperature_c" in data:
-                    return data
+                    age = max(0.0, time.time() - os.path.getmtime(LOCAL_SENSOR_JSON))
+                    if age <= SENSOR_TIMEOUT_SECONDS:
+                        latest_direct_sensor = data
+                        latest_sensor_received_monotonic = time.monotonic() - age
+                        return data
         except Exception:
             pass
 
@@ -584,7 +632,14 @@ def fetch_local_sensor_data():
         if r.status_code == 200:
             res = r.json()
             if res.get("latest"):
-                return res["latest"]
+                remote_sensor = res["latest"]
+                remote_timestamp = remote_sensor.get("timestamp")
+                if remote_timestamp:
+                    age = max(0.0, (datetime.now() - datetime.strptime(remote_timestamp, "%Y-%m-%d %H:%M:%S")).total_seconds())
+                    if age <= SENSOR_TIMEOUT_SECONDS:
+                        latest_direct_sensor = remote_sensor
+                        latest_sensor_received_monotonic = time.monotonic() - age
+                        return remote_sensor
     except Exception:
         pass
 
@@ -688,17 +743,19 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     # 4. Extract Real-Time Sky Telemetry from Headless Video Stream
     with sky_telemetry_lock:
         sky_data = latest_sky_telemetry.copy()
+    sensor_health = get_sensor_status()
+    cloud_health = get_cloud_status(sky_data)
 
-    thickness_pct = sky_data["cloud_thickness_pct"]
-    coverage_pct = sky_data["cloud_coverage_pct"]
-    density_pct = sky_data["cloud_density_pct"]
-    scene_light_pct = sky_data["scene_light_pct"]
-    num_clouds = sky_data["num_clouds_detected"]
-    dom_genus = sky_data["dominant_cloud_genus"]
-    dom_code = sky_data["dominant_cloud_code"]
-    atmo_level = sky_data["atmospheric_level"]
-    rain_outlook = sky_data["rain_outlook"]
-    visual_meteo_score = sky_data["visual_meteo_score_pct"]
+    thickness_pct = sky_data["cloud_thickness_pct"] if cloud_health["available"] else 0.0
+    coverage_pct = sky_data["cloud_coverage_pct"] if cloud_health["available"] else 0.0
+    density_pct = sky_data["cloud_density_pct"] if cloud_health["available"] else ""
+    scene_light_pct = sky_data["scene_light_pct"] if cloud_health["available"] else ""
+    num_clouds = sky_data["num_clouds_detected"] if cloud_health["available"] else ""
+    dom_genus = sky_data["dominant_cloud_genus"] if cloud_health["available"] else "Unavailable"
+    dom_code = sky_data["dominant_cloud_code"] if cloud_health["available"] else ""
+    atmo_level = sky_data["atmospheric_level"] if cloud_health["available"] else "Unavailable"
+    rain_outlook = sky_data["rain_outlook"] if cloud_health["available"] else "Cloud feed unavailable"
+    visual_meteo_score = sky_data["visual_meteo_score_pct"] if cloud_health["available"] else 0.0
 
     # 5. 15-Minute Atmospheric Differentials for ML
     if prev_weather_state is not None:
@@ -773,6 +830,8 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     record = {
         "timestamp": timestamp_str,
         "sensor_timestamp": sensor_info.get("timestamp", "") if sensor_info else "",
+        "sensor_status": sensor_health["status"],
+        "sensor_age_seconds": sensor_health["age_seconds"] if sensor_health["age_seconds"] is not None else "",
         "temperature_c": round(effective_temp, 2),
         "humidity_pct": round(effective_hum, 2),
         "local_sensor_temp_c": round(float(local_temp), 2) if local_temp is not None else "",
@@ -784,10 +843,10 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         "rain_sensor_wetness_pct": round(float(local_rain_wetness_pct), 1) if local_rain_wetness_pct is not None else "",
         "rain_sensor_wet": local_rain_wet if local_rain_wet is not None else "",
         "cloud_base_height_m": round(cloud_base_height_m, 2),
-        "cloud_thickness_pct": round(thickness_pct, 2),
-        "cloud_coverage_pct": round(coverage_pct, 2),
-        "cloud_density_pct": round(density_pct, 2),
-        "scene_light_pct": round(scene_light_pct, 2),
+        "cloud_thickness_pct": round(thickness_pct, 2) if cloud_health["available"] else "",
+        "cloud_coverage_pct": round(coverage_pct, 2) if cloud_health["available"] else "",
+        "cloud_density_pct": round(density_pct, 2) if cloud_health["available"] else "",
+        "scene_light_pct": round(scene_light_pct, 2) if cloud_health["available"] else "",
         "num_clouds_detected": num_clouds,
         "dominant_cloud_genus": dom_genus,
         "dominant_cloud_code": dom_code,
@@ -802,11 +861,13 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         "rf_rain_prediction_pct": round(rf_prob, 2) if rf_prob is not None else "",
         "xgb_rain_prediction_pct": round(xgb_prob, 2) if xgb_prob is not None else "",
         "ml_avg_rain_prediction_pct": round(ml_avg_prob, 2),
-        "visual_meteo_score_pct": round(visual_meteo_score, 2),
+        "visual_meteo_score_pct": round(visual_meteo_score, 2) if cloud_health["available"] else "",
         "final_adjusted_rain_prediction_pct": round(final_prob, 2),
         "predicted_rainfall_category": rainfall_category,
         "stream_status": sky_data.get("stream_status", ""),
         "sky_telemetry_last_updated": sky_data.get("last_updated", ""),
+        "cloud_status": cloud_health["status"],
+        "cloud_age_seconds": cloud_health["age_seconds"] if cloud_health["age_seconds"] is not None else "",
         "data_source": "OpenWeather+HeadlessRTSP+" + ("ESP32" if any(value is not None for value in (local_temp, local_hum, local_pressure_hpa, local_wind_speed_ms, local_wind_direction_deg)) else "Ambient")
     }
 
@@ -1013,7 +1074,7 @@ DASHBOARD_HTML = """
                 </p>
             </div>
             <div class="btn-group">
-                <span class="stream-badge">{{ telemetry.stream_status }}</span>
+                <span class="stream-badge">ESP32: {{ sensor_status.status }} | SKY: {{ telemetry.status }}</span>
                 <button class="btn btn-primary" onclick="triggerGather()">Gather Now</button>
                 <a href="/api/csv" class="btn">Download CSV</a>
             </div>
@@ -1023,7 +1084,7 @@ DASHBOARD_HTML = """
             <div class="card">
                 <div class="card-label">Temperature</div>
                 <div class="card-value">{{ direct_sensor.temperature_c if direct_sensor else (latest.temperature_c if latest else '--') }} °C</div>
-                <div class="card-sub">{{ 'ESP32 SHT45' if direct_sensor else 'OpenWeather' }}</div>
+                <div class="card-sub">{{ 'ESP32 SHT45' if direct_sensor else 'OpenWeather fallback' }} | Sensor: {{ sensor_status.components.temperature_humidity }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Humidity</div>
@@ -1033,12 +1094,12 @@ DASHBOARD_HTML = """
             <div class="card">
                 <div class="card-label">Barometric Pressure</div>
                 <div class="card-value">{{ direct_sensor.pressure_hpa if direct_sensor and direct_sensor.pressure_hpa is defined else (latest.pressure_hpa if latest else '--') }} hPa</div>
-                <div class="card-sub">{{ 'ESP32 BMP580' if direct_sensor and direct_sensor.pressure_hpa is defined else 'OpenWeather' }}</div>
+                <div class="card-sub">{{ 'ESP32 BMP580' if direct_sensor and direct_sensor.pressure_hpa is defined else 'OpenWeather fallback' }} | {{ sensor_status.components.pressure }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Wind Speed</div>
                 <div class="card-value">{{ (direct_sensor.wind_speed_ms * 3.6)|round(2) if direct_sensor and direct_sensor.wind_speed_ms is defined else (latest.wind_speed_kmh if latest else '--') }} km/h</div>
-                <div class="card-sub">{{ direct_sensor.wind_speed_ms if direct_sensor and direct_sensor.wind_speed_ms is defined else '--' }} m/s from ESP32</div>
+                <div class="card-sub">{{ direct_sensor.wind_speed_ms if direct_sensor and direct_sensor.wind_speed_ms is defined else '--' }} m/s from ESP32 | {{ sensor_status.components.wind }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Wind Direction</div>
@@ -1048,7 +1109,7 @@ DASHBOARD_HTML = """
             <div class="card">
                 <div class="card-label">Rain Sensor</div>
                 <div class="card-value">{{ direct_sensor.rain_wetness_pct if direct_sensor and direct_sensor.rain_wetness_pct is defined else '--' }} % wetness</div>
-                <div class="card-sub">{% if direct_sensor and direct_sensor.rain_wet is defined %}{{ 'Wet' if direct_sensor.rain_wet else 'Dry' }}{% else %}No ESP32 reading{% endif %}</div>
+                <div class="card-sub">{% if direct_sensor and direct_sensor.rain_wet is defined %}{{ 'Wet' if direct_sensor.rain_wet else 'Dry' }}{% else %}No ESP32 reading{% endif %} | {{ sensor_status.components.rain }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Cloud Base Height</div>
@@ -1057,18 +1118,18 @@ DASHBOARD_HTML = """
             </div>
             <div class="card">
                 <div class="card-label">Sky Telemetry (Headless)</div>
-                <div class="card-value" style="color: var(--accent-blue);">{{ latest.cloud_thickness_pct if latest else '--' }} %</div>
-                <div class="card-sub">Cover: {{ latest.cloud_coverage_pct if latest else '--' }}% | Density: {{ latest.cloud_density_pct if latest else '--' }}%</div>
+                <div class="card-value" style="color: var(--accent-blue);">{{ telemetry.cloud_thickness_pct if telemetry.available else '--' }} %</div>
+                <div class="card-sub">{{ telemetry.status }} | Cover: {{ telemetry.cloud_coverage_pct if telemetry.available else '--' }}% | Density: {{ telemetry.cloud_density_pct if telemetry.available else '--' }}%</div>
             </div>
             <div class="card">
                 <div class="card-label">Dominant Cloud Genus</div>
-                <div class="card-value" style="font-size: 18px; color: #e2e8f0;">{{ latest.dominant_cloud_genus if latest else '--' }}</div>
-                <div class="card-sub">{{ latest.atmospheric_level if latest else '--' }}</div>
+                <div class="card-value" style="font-size: 18px; color: #e2e8f0;">{{ telemetry.dominant_cloud_genus if telemetry.available else '--' }}</div>
+                <div class="card-sub">{{ telemetry.atmospheric_level if telemetry.available else telemetry.status }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Meteorological Outlook</div>
-                <div class="card-value" style="font-size: 16px; color: var(--accent-amber);">{{ latest.rain_outlook if latest else '--' }}</div>
-                <div class="card-sub">Visual Risk Score: {{ latest.visual_meteo_score_pct if latest else '--' }}%</div>
+                <div class="card-value" style="font-size: 16px; color: var(--accent-amber);">{{ telemetry.rain_outlook if telemetry.available else telemetry.status }}</div>
+                <div class="card-sub">Visual Risk Score: {{ telemetry.visual_meteo_score_pct if telemetry.available else '--' }}%</div>
             </div>
             <div class="card">
                 <div class="card-label">ML Sensor Ensemble (15m)</div>
@@ -1173,10 +1234,14 @@ DASHBOARD_HTML = """
 def index_dashboard():
     with sky_telemetry_lock:
         current_telemetry = latest_sky_telemetry.copy()
+    current_telemetry.update(get_cloud_status(current_telemetry))
+    sensor_health = get_sensor_status()
+    direct_sensor = latest_direct_sensor if sensor_health["available"] else None
     return render_template_string(
         DASHBOARD_HTML,
         latest=latest_gathered_data,
-        direct_sensor=latest_direct_sensor,
+        direct_sensor=direct_sensor,
+        sensor_status=sensor_health,
         telemetry=current_telemetry,
         history=recent_history
     )
@@ -1194,10 +1259,13 @@ def api_gather():
 def api_latest():
     with sky_telemetry_lock:
         current_telemetry = latest_sky_telemetry.copy()
+    sensor_health = get_sensor_status()
+    current_telemetry.update(get_cloud_status(current_telemetry))
     return jsonify({
         "status": "success",
         "latest": latest_gathered_data,
-        "direct_sensor": latest_direct_sensor,
+        "direct_sensor": latest_direct_sensor if sensor_health["available"] else None,
+        "sensor_status": sensor_health,
         "sky_telemetry": current_telemetry,
         "csv_path": ACTIVE_CSV_PATH
     })
@@ -1206,6 +1274,7 @@ def api_latest():
 def api_telemetry():
     with sky_telemetry_lock:
         current_telemetry = latest_sky_telemetry.copy()
+    current_telemetry.update(get_cloud_status(current_telemetry))
     return jsonify({
         "status": "success",
         "telemetry": current_telemetry
@@ -1235,7 +1304,7 @@ def api_download_csv():
 @app.route('/api/sensor-data', methods=['POST', 'GET'])
 @app.route('/api/sensor', methods=['POST', 'GET'])
 def api_sensor_endpoint():
-    global latest_direct_sensor, recent_history
+    global latest_direct_sensor, latest_sensor_received_monotonic, recent_history
     if request.method == 'POST':
         payload = request.get_json(silent=True) or request.form.to_dict()
         if not payload:
@@ -1276,6 +1345,7 @@ def api_sensor_endpoint():
                     if "rain_wet" in payload:
                         raw_wet = payload["rain_wet"]
                         latest_direct_sensor["rain_wet"] = raw_wet if isinstance(raw_wet, bool) else str(raw_wet).lower() in ("true", "1", "yes", "wet")
+                    latest_sensor_received_monotonic = time.monotonic()
                     record = gather_data_cycle()
                     if record is None:
                         with sky_telemetry_lock:
@@ -1295,12 +1365,21 @@ def api_sensor_endpoint():
                             "rain_sensor_wet": latest_direct_sensor.get("rain_wet", ""),
                             "stream_status": sky_data.get("stream_status", ""),
                             "sky_telemetry_last_updated": sky_data.get("last_updated", ""),
+                            "sensor_status": get_sensor_status()["status"],
+                            "sensor_age_seconds": 0.0,
+                            "cloud_status": get_cloud_status(sky_data)["status"],
+                            "cloud_age_seconds": get_cloud_status(sky_data)["age_seconds"] or "",
                             "data_source": "ESP32 (weather API unavailable)"
                         }
-                        for key in ("cloud_thickness_pct", "cloud_coverage_pct", "cloud_density_pct", "scene_light_pct",
-                                    "num_clouds_detected", "dominant_cloud_genus", "dominant_cloud_code", "atmospheric_level",
-                                    "rain_outlook", "visual_meteo_score_pct"):
-                            record[key] = sky_data.get(key, "")
+                        cloud_health = get_cloud_status(sky_data)
+                        cloud_defaults = {
+                            "cloud_thickness_pct": "", "cloud_coverage_pct": "", "cloud_density_pct": "",
+                            "scene_light_pct": "", "num_clouds_detected": "", "dominant_cloud_genus": "Unavailable",
+                            "dominant_cloud_code": "", "atmospheric_level": "Unavailable",
+                            "rain_outlook": "Cloud feed unavailable", "visual_meteo_score_pct": ""
+                        }
+                        for key, unavailable_value in cloud_defaults.items():
+                            record[key] = sky_data.get(key, unavailable_value) if cloud_health["available"] else unavailable_value
                         append_to_csv(record)
                         recent_history.append(record)
                         if len(recent_history) > 200:
@@ -1311,12 +1390,14 @@ def api_sensor_endpoint():
 
         return jsonify({"status": "error", "message": "Temperature and humidity are required"}), 400
 
-    return jsonify({"status": "success", "sensor": latest_direct_sensor})
+    sensor_health = get_sensor_status()
+    return jsonify({"status": "success", "sensor": latest_direct_sensor if sensor_health["available"] else None, "sensor_status": sensor_health})
 
 @app.route('/health', methods=['GET'])
 def api_health():
     with sky_telemetry_lock:
         status_str = latest_sky_telemetry.get("stream_status", "unknown")
+        sky_data = latest_sky_telemetry.copy()
     return jsonify({
         "status": "healthy",
         "rf_model_loaded": rf_model is not None,
@@ -1324,6 +1405,8 @@ def api_health():
         "yolo_model_loaded": yolo_model is not None,
         "cloud_type_loaded": cloud_type_classifier is not None,
         "stream_status": status_str,
+        "sensor_status": get_sensor_status(),
+        "cloud_status": get_cloud_status(sky_data),
         "latest_timestamp": latest_gathered_data.get('timestamp') if latest_gathered_data else None
     })
 
