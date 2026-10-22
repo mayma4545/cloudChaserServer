@@ -1,8 +1,24 @@
+# Web Framework & API Server
 Flask
-Flask-CORS
+Flask-Cors
 requests
+
+# Data Processing & Classical Machine Learning
 numpy
 pandas
-joblib
+scipy
 scikit-learn
 xgboost
+joblib
+
+# Computer Vision & Deep Learning
+opencv-python
+Pillow
+torch
+torchvision
+ultralytics
+PyYAML
+
+# Plotting & Visualization
+matplotlib
+seaborn

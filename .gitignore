@@ -1,0 +1,18 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local telemetry and generated bundles
+sensor_data.json
+sensor_readings.csv
+gathered_weather_data.csv
+*.zip
+
+# Local recordings
+*.mp4
+*.avi
+*.mov
+*.mkv
