@@ -15,9 +15,9 @@ to drastically reduce CPU & GPU memory consumption while continuously extracting
      - Dominant Cloud Genus (Area- & confidence-weighted voting)
      - Meteorological Outlook (Atmospheric Level & Rain Outlook)
 
-  2. Ambient & Local Sensor Telemetry:
+  2. Local Sensor Telemetry:
      - Local ESP32 SHT45 Temperature (°C) & Humidity (%RH)
-     - Ambient OpenWeather parameters (Pressure, Wind vector U/V, 1h rain)
+     - Local ESP32 temperature, humidity, pressure, wind, and rain sensors
      - Cloud Base Height (m) calculated from temperature & dew point
 
   3. Intelligent Dual-Ensemble Rain Prediction Computation:
@@ -93,14 +93,8 @@ from live_cloud_thickness import (
 # 1. CONFIGURATION & CONSTANTS
 # =============================================================================
 DEFAULT_CSV_PATH = os.path.join(PROJECT_ROOT, "gathered_weather_data.csv")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
-
 # Default RTSP Stream URL
 DEFAULT_RTSP_URL = os.getenv("RTSP_URL", "")
-
-# Masbate City coordinates (default)
-DEFAULT_LAT = 12.3715
-DEFAULT_LON = 123.6247
 
 # Path to local sensor data written by ESP32 / cloudChaserServer
 LOCAL_SENSOR_JSON = os.path.join(PROJECT_ROOT, "cloudChaserServer", "sensor_data.json")
@@ -685,35 +679,13 @@ def compute_final_rain_prediction(ml_avg_prob, visual_meteo_score, cloud_thickne
 
     return final_prob, category
 
-def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
+def gather_data_cycle(csv_path=None):
     global latest_gathered_data, prev_weather_state, recent_history
     csv_path = csv_path or ACTIVE_CSV_PATH
 
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Fetch live OpenWeatherMap data
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
-    try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        ow_data = resp.json()
-    except Exception as e:
-        print(f"[{timestamp_str}] [ERROR] OpenWeather API call failed: {e}", flush=True)
-        return None
-
-    ow_temp_c = float(ow_data['main']['temp'])
-    ow_humidity_pct = float(ow_data['main']['humidity'])
-    pressure_hpa = float(ow_data['main']['pressure'])
-
-    wind_speed_ms = float(ow_data.get('wind', {}).get('speed', 0.0))
-    wind_speed_kmh = wind_speed_ms * 3.6
-    wind_direction_deg = float(ow_data.get('wind', {}).get('deg', 0.0))
-
-    weather_main = ow_data.get('weather', [{}])[0].get('main', '')
-    weather_desc = ow_data.get('weather', [{}])[0].get('description', '')
-    rain_1h = float(ow_data.get('rain', {}).get('1h', 0.0))
-
-    # 2. Read Local ESP32 Sensor
+    # 1. Read current ESP32 sensor values
     sensor_info = fetch_local_sensor_data()
     local_temp = None
     local_hum = None
@@ -727,18 +699,18 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     local_rain_wetness_pct = sensor_info.get("rain_wetness_pct") if sensor_info else None
     local_rain_wet = sensor_info.get("rain_wet") if sensor_info else None
 
-    effective_temp = float(local_temp) if local_temp is not None else ow_temp_c
-    effective_hum = float(local_hum) if local_hum is not None else ow_humidity_pct
-    if local_pressure_hpa is not None:
-        pressure_hpa = float(local_pressure_hpa)
-    if local_wind_speed_ms is not None:
-        wind_speed_kmh = float(local_wind_speed_ms) * 3.6
-    if local_wind_direction_deg is not None:
-        wind_direction_deg = float(local_wind_direction_deg) % 360.0
+    effective_temp = float(local_temp) if local_temp is not None else None
+    effective_hum = float(local_hum) if local_hum is not None else None
+    pressure_hpa = float(local_pressure_hpa) if local_pressure_hpa is not None else None
+    wind_speed_kmh = float(local_wind_speed_ms) * 3.6 if local_wind_speed_ms is not None else None
+    wind_direction_deg = float(local_wind_direction_deg) % 360.0 if local_wind_direction_deg is not None else None
 
-    # 3. Calculate Cloud Base Height (Dew point approximation)
-    dew_point_c = effective_temp - ((100.0 - effective_hum) / 5.0)
-    cloud_base_height_m = max(0.0, (effective_temp - dew_point_c) * 125.0)
+    # 2. Calculate Cloud Base Height (Dew point approximation)
+    if effective_temp is not None and effective_hum is not None:
+        dew_point_c = effective_temp - ((100.0 - effective_hum) / 5.0)
+        cloud_base_height_m = max(0.0, (effective_temp - dew_point_c) * 125.0)
+    else:
+        cloud_base_height_m = None
 
     # 4. Extract Real-Time Sky Telemetry from Headless Video Stream
     with sky_telemetry_lock:
@@ -758,7 +730,10 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     visual_meteo_score = sky_data["visual_meteo_score_pct"] if cloud_health["available"] else 0.0
 
     # 5. 15-Minute Atmospheric Differentials for ML
-    if prev_weather_state is not None:
+    sensor_ml_inputs_available = all(value is not None for value in (
+        effective_temp, effective_hum, pressure_hpa, wind_speed_kmh, wind_direction_deg
+    ))
+    if prev_weather_state is not None and sensor_ml_inputs_available:
         temp_drop_15m = effective_temp - prev_weather_state['temp_c']
         humidity_spike_15m = effective_hum - prev_weather_state['humidity_pct']
         pressure_drop_15m = pressure_hpa - prev_weather_state['pressure_hpa']
@@ -767,16 +742,21 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         humidity_spike_15m = 0.0
         pressure_drop_15m = 0.0
 
-    prev_weather_state = {
-        'temp_c': effective_temp,
-        'humidity_pct': effective_hum,
-        'pressure_hpa': pressure_hpa
-    }
+    if sensor_ml_inputs_available:
+        prev_weather_state = {
+            'temp_c': effective_temp,
+            'humidity_pct': effective_hum,
+            'pressure_hpa': pressure_hpa
+        }
 
     # 6. Wind U and V Vectors
-    wind_radians = np.radians(wind_direction_deg)
-    wind_u = -wind_speed_kmh * np.sin(wind_radians)
-    wind_v = -wind_speed_kmh * np.cos(wind_radians)
+    if sensor_ml_inputs_available:
+        wind_radians = np.radians(wind_direction_deg)
+        wind_u = -wind_speed_kmh * np.sin(wind_radians)
+        wind_v = -wind_speed_kmh * np.cos(wind_radians)
+    else:
+        wind_u = None
+        wind_v = None
 
     # 7. ML Predictions (Random Forest + XGBoost)
     feature_cols = [
@@ -801,30 +781,34 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     xgb_prob = None
     probs = []
 
-    if rf_model is not None:
+    if sensor_ml_inputs_available and rf_model is not None:
         try:
             rf_prob = float(rf_model.predict_proba(X_live)[:, 1][0] * 100.0)
             probs.append(rf_prob)
         except Exception:
             pass
 
-    if xgb_model is not None:
+    if sensor_ml_inputs_available and xgb_model is not None:
         try:
             xgb_prob = float(xgb_model.predict_proba(X_live)[:, 1][0] * 100.0)
             probs.append(xgb_prob)
         except Exception:
             pass
 
-    ml_avg_prob = sum(probs) / len(probs) if probs else 0.0
+    ml_avg_prob = sum(probs) / len(probs) if probs else None
 
     # 8. Compute Adjusted Final Rain Prediction (Harmonizing ML + Camera Meteorological Outlook)
-    final_prob, rainfall_category = compute_final_rain_prediction(
-        ml_avg_prob=ml_avg_prob,
-        visual_meteo_score=visual_meteo_score,
-        cloud_thickness=thickness_pct,
-        cloud_coverage=coverage_pct,
-        dominant_code=dom_code
-    )
+    prediction_available = cloud_health["available"] or ml_avg_prob is not None
+    if prediction_available:
+        final_prob, rainfall_category = compute_final_rain_prediction(
+            ml_avg_prob=ml_avg_prob or 0.0,
+            visual_meteo_score=visual_meteo_score,
+            cloud_thickness=thickness_pct,
+            cloud_coverage=coverage_pct,
+            dominant_code=dom_code
+        )
+    else:
+        final_prob, rainfall_category = None, "Unavailable"
 
     # 9. Assemble Complete Record
     record = {
@@ -832,8 +816,8 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         "sensor_timestamp": sensor_info.get("timestamp", "") if sensor_info else "",
         "sensor_status": sensor_health["status"],
         "sensor_age_seconds": sensor_health["age_seconds"] if sensor_health["age_seconds"] is not None else "",
-        "temperature_c": round(effective_temp, 2),
-        "humidity_pct": round(effective_hum, 2),
+        "temperature_c": round(effective_temp, 2) if effective_temp is not None else "",
+        "humidity_pct": round(effective_hum, 2) if effective_hum is not None else "",
         "local_sensor_temp_c": round(float(local_temp), 2) if local_temp is not None else "",
         "local_sensor_humidity_pct": round(float(local_hum), 2) if local_hum is not None else "",
         "local_sensor_pressure_hpa": round(float(local_pressure_hpa), 2) if local_pressure_hpa is not None else "",
@@ -842,7 +826,7 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         "wind_direction_cardinal": sensor_info.get("wind_direction_cardinal", "") if sensor_info else "",
         "rain_sensor_wetness_pct": round(float(local_rain_wetness_pct), 1) if local_rain_wetness_pct is not None else "",
         "rain_sensor_wet": local_rain_wet if local_rain_wet is not None else "",
-        "cloud_base_height_m": round(cloud_base_height_m, 2),
+        "cloud_base_height_m": round(cloud_base_height_m, 2) if cloud_base_height_m is not None else "",
         "cloud_thickness_pct": round(thickness_pct, 2) if cloud_health["available"] else "",
         "cloud_coverage_pct": round(coverage_pct, 2) if cloud_health["available"] else "",
         "cloud_density_pct": round(density_pct, 2) if cloud_health["available"] else "",
@@ -852,23 +836,23 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
         "dominant_cloud_code": dom_code,
         "atmospheric_level": atmo_level,
         "rain_outlook": rain_outlook,
-        "weather_main": weather_main,
-        "weather_description": weather_desc,
-        "rain_1h_mm": round(rain_1h, 2),
-        "pressure_hpa": round(pressure_hpa, 2),
-        "wind_speed_kmh": round(wind_speed_kmh, 2),
-        "wind_direction_deg": round(wind_direction_deg, 2),
+        "weather_main": "",
+        "weather_description": "",
+        "rain_1h_mm": "",
+        "pressure_hpa": round(pressure_hpa, 2) if pressure_hpa is not None else "",
+        "wind_speed_kmh": round(wind_speed_kmh, 2) if wind_speed_kmh is not None else "",
+        "wind_direction_deg": round(wind_direction_deg, 2) if wind_direction_deg is not None else "",
         "rf_rain_prediction_pct": round(rf_prob, 2) if rf_prob is not None else "",
         "xgb_rain_prediction_pct": round(xgb_prob, 2) if xgb_prob is not None else "",
-        "ml_avg_rain_prediction_pct": round(ml_avg_prob, 2),
+        "ml_avg_rain_prediction_pct": round(ml_avg_prob, 2) if ml_avg_prob is not None else "",
         "visual_meteo_score_pct": round(visual_meteo_score, 2) if cloud_health["available"] else "",
-        "final_adjusted_rain_prediction_pct": round(final_prob, 2),
+        "final_adjusted_rain_prediction_pct": round(final_prob, 2) if final_prob is not None else "",
         "predicted_rainfall_category": rainfall_category,
         "stream_status": sky_data.get("stream_status", ""),
         "sky_telemetry_last_updated": sky_data.get("last_updated", ""),
         "cloud_status": cloud_health["status"],
         "cloud_age_seconds": cloud_health["age_seconds"] if cloud_health["age_seconds"] is not None else "",
-        "data_source": "OpenWeather+HeadlessRTSP+" + ("ESP32" if any(value is not None for value in (local_temp, local_hum, local_pressure_hpa, local_wind_speed_ms, local_wind_direction_deg)) else "Ambient")
+        "data_source": "ESP32+HeadlessRTSP" if sensor_info else "HeadlessRTSP"
     }
 
     # 10. Persist to CSV
@@ -883,7 +867,7 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
     # 12. Console Logging
     print(f"\n==================================================================", flush=True)
     print(f"[TELEMETRY GATHERED & LOGGED TO CSV] {timestamp_str}", flush=True)
-    print(f"  * Temperature         : {record['temperature_c']} C " + (f"(ESP32 SHT45)" if local_temp is not None else "(Ambient)"), flush=True)
+    print(f"  * Temperature         : {record['temperature_c']} C (ESP32)" if local_temp is not None else "  * Temperature         : unavailable", flush=True)
     print(f"  * Humidity            : {record['humidity_pct']} %RH", flush=True)
     print(f"  * Cloud Base Height   : {record['cloud_base_height_m']} m", flush=True)
     print(f"  * Sky Thickness       : {record['cloud_thickness_pct']}% | Coverage: {record['cloud_coverage_pct']}%", flush=True)
@@ -903,12 +887,12 @@ def gather_data_cycle(lat=DEFAULT_LAT, lon=DEFAULT_LON, csv_path=None):
 # =============================================================================
 collector_running = True
 
-def background_gathering_worker(interval_sec, lat, lon, csv_path):
+def background_gathering_worker(interval_sec, csv_path):
     global collector_running
     print(f"[INFO] Periodic CSV logging started (Every {interval_sec}s -> {csv_path})", flush=True)
     while collector_running:
         try:
-            gather_data_cycle(lat=lat, lon=lon, csv_path=csv_path)
+            gather_data_cycle(csv_path=csv_path)
         except Exception as e:
             print(f"[ERROR] Periodic gathering cycle error: {e}", flush=True)
         time.sleep(interval_sec)
@@ -1083,28 +1067,28 @@ DASHBOARD_HTML = """
         <div class="grid">
             <div class="card">
                 <div class="card-label">Temperature</div>
-                <div class="card-value">{{ direct_sensor.temperature_c if direct_sensor else (latest.temperature_c if latest else '--') }} °C</div>
-                <div class="card-sub">{{ 'ESP32 SHT45' if direct_sensor else 'OpenWeather fallback' }} | Sensor: {{ sensor_status.components.temperature_humidity }}</div>
+                <div class="card-value">{{ direct_sensor.temperature_c if direct_sensor else '--' }} °C</div>
+                <div class="card-sub">ESP32 SHT45 | Sensor: {{ sensor_status.components.temperature_humidity }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Humidity</div>
-                <div class="card-value">{{ direct_sensor.humidity_pct if direct_sensor else (latest.humidity_pct if latest else '--') }} %</div>
+                <div class="card-value">{{ direct_sensor.humidity_pct if direct_sensor else '--' }} %</div>
                 <div class="card-sub">Relative Humidity (%RH)</div>
             </div>
             <div class="card">
                 <div class="card-label">Barometric Pressure</div>
-                <div class="card-value">{{ direct_sensor.pressure_hpa if direct_sensor and direct_sensor.pressure_hpa is defined else (latest.pressure_hpa if latest else '--') }} hPa</div>
-                <div class="card-sub">{{ 'ESP32 BMP580' if direct_sensor and direct_sensor.pressure_hpa is defined else 'OpenWeather fallback' }} | {{ sensor_status.components.pressure }}</div>
+                <div class="card-value">{{ direct_sensor.pressure_hpa if direct_sensor and direct_sensor.pressure_hpa is defined else '--' }} hPa</div>
+                <div class="card-sub">ESP32 BMP580 | {{ sensor_status.components.pressure }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Wind Speed</div>
-                <div class="card-value">{{ (direct_sensor.wind_speed_ms * 3.6)|round(2) if direct_sensor and direct_sensor.wind_speed_ms is defined else (latest.wind_speed_kmh if latest else '--') }} km/h</div>
+                <div class="card-value">{{ (direct_sensor.wind_speed_ms * 3.6)|round(2) if direct_sensor and direct_sensor.wind_speed_ms is defined else '--' }} km/h</div>
                 <div class="card-sub">{{ direct_sensor.wind_speed_ms if direct_sensor and direct_sensor.wind_speed_ms is defined else '--' }} m/s from ESP32 | {{ sensor_status.components.wind }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Wind Direction</div>
-                <div class="card-value">{{ direct_sensor.wind_direction_deg if direct_sensor and direct_sensor.wind_direction_deg is defined else (latest.wind_direction_deg if latest else '--') }}°</div>
-                <div class="card-sub">{{ direct_sensor.wind_direction_cardinal if direct_sensor and direct_sensor.wind_direction_cardinal is defined else (latest.wind_direction_cardinal if latest and latest.wind_direction_cardinal else 'OpenWeather / unavailable') }}</div>
+                <div class="card-value">{{ direct_sensor.wind_direction_deg if direct_sensor and direct_sensor.wind_direction_deg is defined else '--' }}°</div>
+                <div class="card-sub">{{ direct_sensor.wind_direction_cardinal if direct_sensor and direct_sensor.wind_direction_cardinal is defined else sensor_status.components.wind }}</div>
             </div>
             <div class="card">
                 <div class="card-label">Rain Sensor</div>
@@ -1133,12 +1117,12 @@ DASHBOARD_HTML = """
             </div>
             <div class="card">
                 <div class="card-label">ML Sensor Ensemble (15m)</div>
-                <div class="card-value">{{ latest.ml_avg_rain_prediction_pct if latest else '--' }} %</div>
+                <div class="card-value">{{ latest.ml_avg_rain_prediction_pct if latest and latest.ml_avg_rain_prediction_pct != '' else '--' }} %</div>
                 <div class="card-sub">RF: {{ latest.rf_rain_prediction_pct if latest else '--' }}% | XGB: {{ latest.xgb_rain_prediction_pct if latest else '--' }}%</div>
             </div>
             <div class="card highlight-card">
                 <div class="card-label" style="color: var(--accent-amber);">FINAL ADJUSTED RAIN CHANCE</div>
-                <div class="card-value" style="color: var(--accent-amber); font-size: 26px;">{{ latest.final_adjusted_rain_prediction_pct if latest else '--' }} %</div>
+                <div class="card-value" style="color: var(--accent-amber); font-size: 26px;">{{ latest.final_adjusted_rain_prediction_pct if latest and latest.final_adjusted_rain_prediction_pct != '' else '--' }} %</div>
                 <div class="card-sub">
                     {% if latest and latest.final_adjusted_rain_prediction_pct != '' %}
                         {% if latest.final_adjusted_rain_prediction_pct >= 70 %}
@@ -1248,9 +1232,7 @@ def index_dashboard():
 
 @app.route('/api/gather', methods=['GET', 'POST'])
 def api_gather():
-    lat = request.args.get('lat', default=DEFAULT_LAT, type=float)
-    lon = request.args.get('lon', default=DEFAULT_LON, type=float)
-    record = gather_data_cycle(lat=lat, lon=lon)
+    record = gather_data_cycle()
     if record:
         return jsonify({"status": "success", "data": record}), 200
     return jsonify({"status": "error", "message": "Failed gathering data"}), 500
@@ -1423,8 +1405,6 @@ def main():
                         help="Headless video analysis rate in FPS (default: 1.0 FPS for minimal memory/CPU)")
     parser.add_argument("--interval", type=int, default=10,
                         help="Periodic CSV logging interval in seconds (default: 10s; 0 to disable periodic)")
-    parser.add_argument("--lat", type=float, default=DEFAULT_LAT, help="Latitude (default: 12.3715)")
-    parser.add_argument("--lon", type=float, default=DEFAULT_LON, help="Longitude (default: 123.6247)")
     parser.add_argument("--csv", type=str, default=DEFAULT_CSV_PATH, help="Output CSV path")
     args = parser.parse_args()
 
@@ -1447,13 +1427,13 @@ def main():
 
     # 2. Run initial gathering cycle
     print("\n[STARTUP] Running initial telemetry gathering cycle...", flush=True)
-    gather_data_cycle(lat=args.lat, lon=args.lon, csv_path=args.csv)
+    gather_data_cycle(csv_path=args.csv)
 
     # 3. Start periodic background CSV logging worker
     if args.interval > 0:
         gather_thread = threading.Thread(
             target=background_gathering_worker,
-            args=(args.interval, args.lat, args.lon, args.csv),
+            args=(args.interval, args.csv),
             daemon=True
         )
         gather_thread.start()
